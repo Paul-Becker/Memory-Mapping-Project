@@ -50,31 +50,65 @@ static inline uint64_t mix(uint64_t x) {
 void log_line(std::ofstream& log, std::mutex& m, const std::string& s) {
     std::lock_guard<std::mutex> lock(m);
     log << s << '\n';
-    log.flush();
+    //log.flush();
 }
 
 int main(int argc, char** argv) {
     const uint64_t N = (argc > 1) ? std::stoull(argv[1]) : 100000;
     const unsigned   W = (argc > 2) ? static_cast<unsigned>(std::stoul(argv[2])) : std::thread::hardware_concurrency();
     const size_t length = 100 * 1024 * 1024; // 100 MB
+    
+    std::vector<char> ready;
+    ready.resize(N, 0);
 
 
-    // Open files (truncate)
-    std::ofstream comm("comm.dat", std::ios::binary | std::ios::trunc);
-    std::ofstream results("results.dat", std::ios::binary | std::ios::trunc);
+    // kept log as an fstream so we could still log if we crash
     std::ofstream log("app.log", std::ios::out | std::ios::trunc);
-    if (!comm || !results || !log) { std::cerr << "Failed to open output files.\n"; return 1; }
+    if (!log) { std::cerr << "Failed to open log\n"; return 1; }
 
-    int fd = ::open("comm.dat", O_RDWR | O_CREAT, 0644);
-    if (fd == -1) {perror("open broke"); return 1; }
+    // using these and truncating later because I was crashing
+    // from having the wrong length
+    const size_t commLength = static_cast<size_t>(N) * sizeof(Record);
+    const size_t resultsLength = static_cast<size_t>(N) * sizeof(Result);
+
+    int commFD = ::open("comm.dat", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    int resultFD = ::open("results.dat", O_RDWR | O_CREAT | O_TRUNC, 0644);
+
+    if (commFD == -1 || resultFD == -1) {
+	perror("couldn't open comm or result\n");
+	return 1;
+    }
+
+    // truncating here now
+    if (ftruncate(commFD, static_cast<off_t>(commLength)) == -1) {
+	perror("couldn't truncatre comm\n");
+	return 1;
+    }
+    if (ftruncate(resultFD, static_cast<off_t>(resultsLength)) == -1) {
+	perror("couldn't truncate results\n");
+	return 1;
+    }
+
+    // set up the maps
+    void* commMap = mmap(nullptr, commLength, PROT_READ | PROT_WRITE,
+		         MAP_SHARED, commFD, 0); 
+    void* resultsMap = mmap(nullptr, resultsLength, PROT_READ | PROT_WRITE,
+		            MAP_SHARED, resultFD, 0);
+
+    if (resultsMap == MAP_FAILED || commMap == MAP_FAILED) {
+	perror("mmap broke\n");
+	return 1;
+    }
+
+    Record* commData = static_cast<Record*>(commMap);
+    Result* resultData = static_cast<Result*>(resultsMap);
+
+
 
     SharedState S;
     S.total = N;
 
-    void* map = mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    char* data = static_cast<char*>(map);
 
-    if (map == MAP_FAILED) { perror("mmap"); ::close(fd); return 1; }
 
     auto t0 = clock_type::now();
 
@@ -85,11 +119,16 @@ int main(int argc, char** argv) {
             {
                 // shared file for communication
                 std::lock_guard<std::mutex> lk(S.m_comm);
-                std:: memcpy(data + (i*sizeof(r.payload)), &r, sizeof(r.payload))
+                //std:: memcpy(data + (i*sizeof(r.payload)), &r, sizeof(r.payload))
                 //comm.write(reinterpret_cast<const char*>(&r), sizeof(r));
-                comm.flush(); // intentional for baseline (costly)
+                //comm.flush(); // intentional for baseline (costly)
+
+	        //std::memcpy(&commMap[i], &r, sizeof(Record));
+		commData[i] = r;
+		ready[i] = 1;
             }
-            S.write_idx.fetch_add(1, std::memory_order_release);
+	    //ready[i].store(1, std::memory_order_release);
+            //S.write_idx.fetch_add(1, std::memory_order_release);
 
             if ((i & 0xFFFF) == 0) {
                 log_line(log, S.m_log, "Produced up to id=" + std::to_string(i));
@@ -103,7 +142,7 @@ int main(int argc, char** argv) {
         }
         {
             std::lock_guard<std::mutex> lk(S.m_comm);
-            comm.flush();
+            //comm.flush();
         }
         S.done = true;
         S.cv.notify_all();
@@ -114,41 +153,52 @@ int main(int argc, char** argv) {
     workers.reserve(W);
     for (unsigned w = 0; w < W; ++w) {
         workers.emplace_back([&, w]{
-            std::ifstream reader("comm.dat", std::ios::binary);
-            if (!reader) return;
+            //std::ifstream reader("comm.dat", std::ios::binary);
+            //if (!reader) return;
 
             while (true) {
                 // claim next index
                 uint64_t my_idx = S.read_idx.fetch_add(1, std::memory_order_acq_rel);
                 // wait until producer has written it (or finished)
                 std::unique_lock<std::mutex> ul(S.m_comm); // lock only to pair with cv wait
-                S.cv.wait(ul, [&]{ return S.write_idx.load(std::memory_order_acquire) > my_idx || S.done; });
-                ul.unlock();
+                //S.cv.wait(ul, [&]{ return S.write_idx.load(std::memory_order_acquire) > my_idx || S.done; });
+		S.cv.wait(ul, [&]{ return ready[my_idx] || S.done; });
 
-                if (my_idx >= S.write_idx.load(std::memory_order_acquire)) {
-                    if (S.done) break;
-                    // someone else progressed; retry
-                    continue;
-                }
+		if (!ready[my_idx]) {
+		    ul.unlock();
+		    break;
+		}
+		ul.unlock();
+                //ul.unlock();
+
+                //if (my_idx >= S.write_idx.load(std::memory_order_acquire)) {
+                //    if (S.done) break;
+                //    // someone else progressed; retry
+                //    continue;
+                //}
 
                 // read the record at position my_idx
-                std::streampos offset = static_cast<std::streampos>(my_idx) * static_cast<std::streampos>(sizeof(Record));
-                reader.clear();
-                reader.seekg(offset, std::ios::beg);
-                Record r{};
-                reader.read(reinterpret_cast<char*>(&r), sizeof(r));
-                if (!reader) break;
+                //std::streampos offset = static_cast<std::streampos>(my_idx) * static_cast<std::streampos>(sizeof(Record));
+                //reader.clear();
+                //reader.seekg(offset, std::ios::beg);
+                //Record r{};
+                //reader.read(reinterpret_cast<char*>(&r), sizeof(r));
+                //if (!reader) break;
 
-                // "Process" the payload
-                Result out{ r.id, mix(r.payload) };
+                //// "Process" the payload
+                //Result out{ r.id, mix(r.payload) };
 
                 // append to results file
                 {
-                    std::lock_guard<std::mutex> lk(S.m_results);
+                    //std::lock_guard<std::mutex> lk(S.m_results);
 
-                    results.write(reinterpret_cast<const char*>(&out), sizeof(out));
-                    results.flush(); // baseline intentionally flushes
+                    //results.write(reinterpret_cast<const char*>(&out), sizeof(out));
+                    //results.flush(); // baseline intentionally flushes
                 }
+
+		Record r = commData[my_idx];
+		Result out {r.id, mix(r.payload)};
+		resultData[my_idx] = out;
 
                 if ((my_idx & 0xFFFF) == 0) {
                     log_line(log, S.m_log, "Worker " + std::to_string(w) + " processed id=" + std::to_string(my_idx));
@@ -161,6 +211,23 @@ int main(int argc, char** argv) {
 
     producer.join();
     for (auto& t : workers) t.join();
+
+    msync(resultsMap, resultsLength, MS_SYNC);
+    msync(commMap, commLength, MS_SYNC);
+
+    munmap(resultsMap, resultsLength);
+    munmap(commMap, commLength);
+
+    // just flushing the log once now
+    {
+        std::lock_guard<std::mutex> lk(S.m_log);
+        log.flush();
+    }
+
+    close(commFD);
+    close(resultFD);
+
+
 
     auto t1 = clock_type::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
