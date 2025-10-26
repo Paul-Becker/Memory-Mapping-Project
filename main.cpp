@@ -1,3 +1,14 @@
+/* 
+ * Authors: Paul Becker, Zhan Su, William Waweru, Gan-Orgil Gantumur
+ * Assignment Name: Multithreaded File IO Program - Fix 
+ * Assignment Description: Make this slow program that writes
+ * 			   to disk too much use mmap() so that
+ * 			   it's faster
+ * Due Date: 10/26/2025
+ * Date Created: 10/17/2025
+ * Date Last Modified: 10/25/2025
+*/
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
